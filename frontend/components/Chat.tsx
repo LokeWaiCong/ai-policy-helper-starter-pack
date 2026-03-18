@@ -37,7 +37,7 @@ export default function Chat() {
             {m.citations && m.citations.length>0 && (
               <div style={{marginTop:6}}>
                 {m.citations.map((c, idx) => (
-                  <span key={idx} className="badge" title={c.section || ''}>{c.title}</span>
+                  <span key={idx} className="badge" title={c.section || ''} style={{marginRight: 6}}>{c.title}</span>
                 ))}
               </div>
             )}

@@ -1,27 +1,56 @@
-import time, os, math, json, hashlib
+import time, os, hashlib, uuid
 from typing import List, Dict, Tuple
 import numpy as np
 from .settings import settings
 from .ingest import chunk_text, doc_hash
 from qdrant_client import QdrantClient, models as qm
 
-# ---- Simple local embedder (deterministic) ----
-def _tokenize(s: str) -> List[str]:
-    return [t.lower() for t in s.split()]
+# ---- Embedders ----
+class OpenRouterEmbedder:
+    """Uses OpenRouter's text-embedding-3-small API (384-dim)."""
+    MODEL = "openai/text-embedding-3-small"
 
-class LocalEmbedder:
-    def __init__(self, dim: int = 384):
+    def __init__(self, api_key: str, dim: int = 384):
+        from openai import OpenAI
+        self.client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
         self.dim = dim
 
     def embed(self, text: str) -> np.ndarray:
-        # Hash-based repeatable pseudo-embedding
-        h = hashlib.sha1(text.encode("utf-8")).digest()
-        rng_seed = int.from_bytes(h[:8], "big") % (2**32-1)
-        rng = np.random.default_rng(rng_seed)
-        v = rng.standard_normal(self.dim).astype("float32")
-        # L2 normalize
-        v = v / (np.linalg.norm(v) + 1e-9)
-        return v
+        resp = self.client.embeddings.create(
+            model=self.MODEL,
+            input=text[:8000],
+            dimensions=self.dim,
+        )
+        v = np.array(resp.data[0].embedding, dtype="float32")
+        norm = np.linalg.norm(v)
+        return v / (norm + 1e-9)
+
+
+class TFIDFEmbedder:
+    """Lightweight corpus-aware TF-IDF embedder — no GPU, no heavy deps."""
+
+    def __init__(self, dim: int = 384):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        self.dim = dim
+        self.vectorizer = TfidfVectorizer(max_features=dim, stop_words="english", sublinear_tf=True)
+        self._fitted = False
+
+    def fit(self, texts: List[str]):
+        self.vectorizer.fit(texts)
+        self._fitted = True
+
+    def embed(self, text: str) -> np.ndarray:
+        if not self._fitted:
+            self.vectorizer.fit([text])
+            self._fitted = True
+        v = self.vectorizer.transform([text]).toarray()[0].astype("float32")
+        # Pad or truncate to exactly self.dim
+        if len(v) < self.dim:
+            v = np.pad(v, (0, self.dim - len(v)))
+        else:
+            v = v[:self.dim]
+        norm = np.linalg.norm(v)
+        return v / (norm + 1e-9)
 
 # ---- Vector store abstraction ----
 class InMemoryStore:
@@ -56,7 +85,15 @@ class QdrantStore:
         self.client = QdrantClient(url="http://qdrant:6333", timeout=10.0)
         self.collection = collection
         self.dim = dim
-        self._ensure_collection()
+        # Retry until qdrant is ready (up to ~30s)
+        for attempt in range(15):
+            try:
+                self._ensure_collection()
+                return
+            except Exception:
+                if attempt < 14:
+                    time.sleep(2)
+        self._ensure_collection()  # final attempt — raise if still failing
 
     def _ensure_collection(self):
         try:
@@ -70,7 +107,10 @@ class QdrantStore:
     def upsert(self, vectors: List[np.ndarray], metadatas: List[Dict]):
         points = []
         for i, (v, m) in enumerate(zip(vectors, metadatas)):
-            points.append(qm.PointStruct(id=m.get("id") or m.get("hash") or i, vector=v.tolist(), payload=m))
+            # Qdrant requires unsigned int or UUID — derive a UUID from the SHA-256 hash
+            h = m.get("hash") or hashlib.sha256(str(i).encode()).hexdigest()
+            point_id = str(uuid.UUID(hex=h[:32]))
+            points.append(qm.PointStruct(id=point_id, vector=v.tolist(), payload=m))
         self.client.upsert(collection_name=self.collection, points=points)
 
     def search(self, query: np.ndarray, k: int = 4) -> List[Tuple[float, Dict]]:
@@ -122,26 +162,32 @@ class OpenRouterLLM:
 # ---- RAG Orchestrator & Metrics ----
 class Metrics:
     def __init__(self):
-        self.t_retrieval = []
-        self.t_generation = []
+        self.t_retrieval: List[float] = []
+        self.t_generation: List[float] = []
+        self.total_queries: int = 0
 
     def add_retrieval(self, ms: float):
         self.t_retrieval.append(ms)
 
     def add_generation(self, ms: float):
         self.t_generation.append(ms)
+        self.total_queries += 1
 
     def summary(self) -> Dict:
-        avg_r = sum(self.t_retrieval)/len(self.t_retrieval) if self.t_retrieval else 0.0
-        avg_g = sum(self.t_generation)/len(self.t_generation) if self.t_generation else 0.0
+        avg_r = sum(self.t_retrieval) / len(self.t_retrieval) if self.t_retrieval else 0.0
+        avg_g = sum(self.t_generation) / len(self.t_generation) if self.t_generation else 0.0
         return {
+            "total_queries": self.total_queries,
             "avg_retrieval_latency_ms": round(avg_r, 2),
             "avg_generation_latency_ms": round(avg_g, 2),
         }
 
 class RAGEngine:
     def __init__(self):
-        self.embedder = LocalEmbedder(dim=384)
+        # Always use TF-IDF for embeddings (fully offline, no API key needed)
+        self.embedder = TFIDFEmbedder(dim=384)
+        self.embedding_name = "tfidf-384"
+
         # Vector store selection
         if settings.vector_store == "qdrant":
             try:
@@ -174,6 +220,10 @@ class RAGEngine:
         vectors = []
         metas = []
         doc_titles_before = set(self._doc_titles)
+
+        # Fit TF-IDF on the full corpus before embedding
+        if isinstance(self.embedder, TFIDFEmbedder):
+            self.embedder.fit([ch["text"] for ch in chunks])
 
         for ch in chunks:
             text = ch["text"]
@@ -212,9 +262,9 @@ class RAGEngine:
         return {
             "total_docs": len(self._doc_titles),
             "total_chunks": self._chunk_count,
-            "embedding_model": settings.embedding_model,
+            "embedding_model": self.embedding_name,
             "llm_model": self.llm_name,
-            **m
+            **m,
         }
 
 # ---- Helpers ----
